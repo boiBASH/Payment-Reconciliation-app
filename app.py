@@ -1,18 +1,18 @@
-# app.py
-# Streamlit app to verify iClass transactions using Moniepoint statement credits.
+# app.py  —  iClass ⇄ Moniepoint Reconciliation (Streamlit)
 #
 # HOW TO RUN
-#   pip install streamlit pandas numpy xlsxwriter openpyxl
+#   pip install -r requirements.txt
 #   streamlit run app.py
 #
-# WHAT IT DOES
-# - Upload two CSVs (iClass + Moniepoint)
-# - Map columns (pre-filled to your headers)
-# - Pick bank amount source (Net Settlement, Gross Amount Paid, or Net = Gross - Charge)
-# - Params: date window (±days), amount tolerance (₦), ref extraction, strict ref match
-# - Matching: amount + date window (+ ref exact / ref-in-narration as signals), greedy one-to-one
-# - Dashboard: row counts, money totals, daily totals, match pairs
-# - Downloads: Excel (3 sheets) + CSVs
+# WHAT’S INSIDE
+# - Upload iClass.csv + Moniepoint.csv
+# - Column mapping (pre-fills to your headers)
+# - Bank amount source: Gross (Amount Paid), Net (Settlement Credit), or Net = Amount Paid - Charge
+# - Params: date window (±days), amount tolerance (₦), ref extraction, strict ref
+# - Matching: amount + date window (+ ref signals), greedy one-to-one
+# - Dashboard: row counts, NAIRA totals, daily totals, match pairs
+# - Downloads: Excel (3 sheets + config) + CSVs
+# - Robust to missing reference selections (no more AttributeError)
 
 import io
 import re
@@ -36,7 +36,7 @@ def to_amount(x):
     s = s.replace(",", "").replace("NGN", "").replace("₦", "").strip()
     try:
         return float(s)
-    except:  # noqa: E722
+    except Exception:
         return np.nan
 
 def norm_ref(x):
@@ -130,10 +130,19 @@ with col1:
     st.subheader("iClass")
     ic_date   = st.selectbox("Date", options=ic_columns, index=default_index(ic_columns, default_ic_date), key="ic_date")
     ic_amount = st.selectbox("Amount", options=ic_columns, index=default_index(ic_columns, default_ic_amount), key="ic_amount")
-    ic_ref_primary   = st.selectbox("Reference (primary)", options=ic_columns, index=default_index(ic_columns, default_ic_ref_a), key="ic_ref_primary")
-    ic_ref_fallback_options = ["(none)"] + ic_columns
-    ic_ref_fallback  = st.selectbox("Reference (fallback)", options=ic_ref_fallback_options, index=default_index(ic_ref_fallback_options, default_ic_ref_b), key="ic_ref_fallback")
-    ic_desc_cols = st.multiselect("Description columns (tie-break)", options=ic_columns, default=[c for c in default_ic_descs if c in ic_columns], key="ic_desc_cols")
+
+    # Reference selections (robust; can be empty)
+    ic_ref_primary   = st.selectbox(
+        "Reference (primary)", options=["(none)"] + ic_columns,
+        index=default_index(["(none)"] + ic_columns, default_ic_ref_a), key="ic_ref_primary")
+    ic_ref_fallback  = st.selectbox(
+        "Reference (fallback)", options=["(none)"] + ic_columns,
+        index=default_index(["(none)"] + ic_columns, default_ic_ref_b), key="ic_ref_fallback")
+
+    ic_desc_cols = st.multiselect(
+        "Description columns (tie-break)", options=ic_columns,
+        default=[c for c in default_ic_descs if c in ic_columns], key="ic_desc_cols"
+    )
 
 with col2:
     st.subheader("Moniepoint")
@@ -148,24 +157,56 @@ with col2:
         index=0,
         label_visibility="collapsed",
     )
-    # let the user map columns that those choices rely on
-    b_credit = st.selectbox("Column: Settlement Credit (NGN)", options=b_columns, index=default_index(b_columns, default_b_credit), key="b_credit")
-    b_amtpaid = st.selectbox("Column: Amount Paid (gross)", options=b_columns, index=default_index(b_columns, default_b_amtpaid), key="b_amtpaid")
-    b_charge = st.selectbox("Column: Charge (NGN)", options=["(none)"] + b_columns, index=default_index(["(none)"] + b_columns, default_b_charge), key="b_charge")
+
+    # Show only the relevant column pickers for the chosen mode (fix for your screenshot).
+    if bank_amount_source == "Gross: Amount Paid":
+        b_amtpaid = st.selectbox(
+            "Column: Amount Paid (gross)", options=b_columns,
+            index=default_index(b_columns, default_b_amtpaid), key="b_amtpaid")
+        b_credit = None
+        b_charge = None
+
+    elif bank_amount_source == "Net: Settlement Credit (NGN)":
+        b_credit = st.selectbox(
+            "Column: Settlement Credit (NGN)", options=b_columns,
+            index=default_index(b_columns, default_b_credit), key="b_credit")
+        b_amtpaid = None
+        b_charge = None
+
+    else:  # "Net: Amount Paid - Charge (NGN)"
+        b_amtpaid = st.selectbox(
+            "Column: Amount Paid (gross)", options=b_columns,
+            index=default_index(b_columns, default_b_amtpaid), key="b_amtpaid")
+        b_charge = st.selectbox(
+            "Column: Charge (NGN)", options=b_columns,
+            index=default_index(b_columns, default_b_charge), key="b_charge")
+        b_credit = None
 
 st.divider()
 
 # ======================= Reconciliation Core =======================
-def run_recon(ic_df, bk_df, mapping, date_window=1, amount_tol=0.0, require_exact_ref=False, enrich_ref=True, bank_amount_source="Gross: Amount Paid"):
-    # --- iClass standardize ---
+def run_recon(
+    ic_df, bk_df, mapping,
+    date_window=1, amount_tol=0.0,
+    require_exact_ref=False, enrich_ref=True,
+    bank_amount_source="Gross: Amount Paid"
+):
+    # --- iClass standardize (robust to missing ref selections) ---
     ic_amount = mapping["ic_amount"]; ic_date = mapping["ic_date"]
-    ic_ref_1 = mapping["ic_ref_primary"]; ic_ref_2 = mapping.get("ic_ref_fallback")
+    ic_ref_1 = mapping.get("ic_ref_primary")
+    ic_ref_2 = mapping.get("ic_ref_fallback")
     ic_desc_cols = mapping.get("ic_desc_cols", [])
 
-    ic_ref = ic_df[ic_ref_1].apply(norm_ref) if ic_ref_1 else None
-    if ic_ref_2 and ic_ref_2 != "(none)":
-        ic_ref = ic_ref.fillna(ic_df[ic_ref_2].apply(norm_ref))
+    # start with an all-None Series
+    ic_ref = pd.Series([None] * len(ic_df), dtype="object")
 
+    if ic_ref_1 and ic_ref_1 != "(none)" and ic_ref_1 in ic_df.columns:
+        ic_ref = ic_df[ic_ref_1].apply(norm_ref)
+
+    if ic_ref_2 and ic_ref_2 != "(none)" and ic_ref_2 in ic_df.columns:
+        ic_ref = ic_ref.where(ic_ref.notna(), ic_df[ic_ref_2].apply(norm_ref))
+
+    # description (optional)
     ic_desc = None
     if ic_desc_cols:
         ic_desc = ic_df[ic_desc_cols[0]].astype(str)
@@ -176,22 +217,35 @@ def run_recon(ic_df, bk_df, mapping, date_window=1, amount_tol=0.0, require_exac
         "i_row_id": ic_df.index,
         "i_amount": ic_df[ic_amount].apply(to_amount),
         "i_date":   ic_df[ic_date].apply(to_date),
-        "i_ref":    ic_ref if ic_ref is not None else None,
+        "i_ref":    ic_ref,
         "i_desc":   ic_desc if ic_desc is not None else None,
-        "i_success": True  # treating iClass list as candidates; verification is by bank presence
+        "i_success": True
     })
 
     # --- bank standardize ---
-    # decide b_amount based on user's choice
+    # choose bank amount series based on user's radio
     choice = bank_amount_source
     if choice == "Net: Settlement Credit (NGN)":
-        b_amount = bk_df[mapping["b_credit"]].apply(to_amount)
+        col = mapping.get("b_credit")
+        if not col or col not in bk_df.columns:
+            st.error("Please select the **Settlement Credit (NGN)** column.")
+            st.stop()
+        b_amount = bk_df[col].apply(to_amount)
+
     elif choice == "Gross: Amount Paid":
-        b_amount = bk_df[mapping["b_amtpaid"]].apply(to_amount)
+        col = mapping.get("b_amtpaid")
+        if not col or col not in bk_df.columns:
+            st.error("Please select the **Amount Paid (gross)** column.")
+            st.stop()
+        b_amount = bk_df[col].apply(to_amount)
+
     else:  # "Net: Amount Paid - Charge (NGN)"
-        gross = bk_df[mapping["b_amtpaid"]].apply(to_amount)
-        charge = bk_df[mapping["b_charge"]].apply(to_amount) if mapping["b_charge"] != "(none)" and mapping["b_charge"] in bk_df.columns else 0.0
-        b_amount = gross - charge
+        col_g = mapping.get("b_amtpaid")
+        col_c = mapping.get("b_charge")
+        if (not col_g or col_g not in bk_df.columns) or (not col_c or col_c not in bk_df.columns):
+            st.error("Please select both **Amount Paid (gross)** and **Charge (NGN)** columns.")
+            st.stop()
+        b_amount = bk_df[col_g].apply(to_amount) - bk_df[col_c].apply(to_amount)
 
     b_std = pd.DataFrame({
         "b_row_id": bk_df.index,
@@ -200,12 +254,12 @@ def run_recon(ic_df, bk_df, mapping, date_window=1, amount_tol=0.0, require_exac
         "b_ref":    bk_df[mapping["b_ref"]].apply(norm_ref),
         "b_desc":   bk_df[mapping["b_desc"]].astype(str)
     })
-    # strictly keep positive inflows
+    # positive inflows only
     b_std = b_std[b_std["b_amount"] > 0].copy()
     if enrich_ref:
         b_std.loc[b_std["b_ref"].isna(), "b_ref"] = b_std["b_desc"].apply(extract_ref_from_text)
 
-    # bucketed amounts for equality joins
+    # rounded buckets (fast equality on amounts)
     i_succ = i_std.copy()
     b_std = b_std.copy()
     i_succ["i_amount_r"] = i_succ["i_amount"].round(2)
@@ -228,7 +282,7 @@ def run_recon(ic_df, bk_df, mapping, date_window=1, amount_tol=0.0, require_exac
             how="inner"
         )
     else:
-        # allow amount tolerance: merge on date only then filter by |amount diff| <= tol
+        # allow tolerance: join on date then filter by |diff| <= tol
         cand_amt_date = exp.merge(
             b_std[["b_row_id","b_amount","b_amount_r","b_date","b_desc","b_ref"]],
             left_on=["i_date_block"],
@@ -253,7 +307,7 @@ def run_recon(ic_df, bk_df, mapping, date_window=1, amount_tol=0.0, require_exac
                 cand_ref_exact = c2[["i_row_id","i_amount_r","i_date","i_ref","i_desc","b_row_id","b_date","b_desc","b_ref","b_amount","b_amount_r"]].copy()
                 cand_ref_exact["rule"] = "ref=exact"
 
-    # ref appears in description
+    # ref appears in narration
     cand_ref_desc = pd.DataFrame(columns=cand_amt_date.columns)
     if "i_ref" in i_succ.columns and "b_desc" in b_std.columns:
         tmp = b_std.copy()
@@ -285,19 +339,18 @@ def run_recon(ic_df, bk_df, mapping, date_window=1, amount_tol=0.0, require_exac
     cand_all["date_delta_days"] = (cand_all["b_date"] - cand_all["i_date"]).abs().dt.days
     cand_all["desc_sim"] = cand_all.apply(lambda r: text_sim(r.get("i_desc_x"), r.get("b_desc")), axis=1)
 
-    # filter by tolerance if we were in equality mode earlier (keeps logic consistent)
+    # if tolerance set in equality branch, enforce uniformly
     if amount_tol > 1e-9 and "amt_diff" in cand_all:
         cand_all = cand_all[cand_all["amt_diff"] <= float(amount_tol) + 1e-9]
 
-    # base score
+    # base score + bonuses for ref signals
     cand_all["score"] = 10*cand_all["amt_diff"] + 2*cand_all["date_delta_days"] - 5*cand_all["desc_sim"]
-    # big bonus for strong ref signals
     ref_equal = (cand_all["i_ref"].notna()) & (cand_all["b_ref"].notna()) & (cand_all["i_ref"] == cand_all["b_ref"])
     ref_in_desc = cand_all["rule"].eq("ref∈desc")
     cand_all.loc[ref_equal, "score"] -= 1000.0
     cand_all.loc[ref_in_desc, "score"] -= 150.0
 
-    # strict mode
+    # strict mode (require exact ref)
     if require_exact_ref:
         cand_all = cand_all[ref_equal]
 
@@ -341,9 +394,13 @@ if run_btn:
             "ic_date": ic_date, "ic_amount": ic_amount,
             "ic_ref_primary": ic_ref_primary, "ic_ref_fallback": ic_ref_fallback,
             "ic_desc_cols": ic_desc_cols,
-            "b_date": b_date, "b_credit": b_credit, "b_ref": b_ref, "b_desc": b_desc,
-            "b_amtpaid": b_amtpaid, "b_charge": b_charge
+            "b_date": b_date, "b_ref": b_ref, "b_desc": b_desc,
+            # Only the columns relevant to the chosen bank amount source will be used:
+            "b_credit": b_credit if "b_credit" in locals() else None,
+            "b_amtpaid": b_amtpaid if "b_amtpaid" in locals() else None,
+            "b_charge": b_charge if "b_charge" in locals() else None,
         }
+
         recon, b_std, unmatched_iclass, unmatched_bank = run_recon(
             ic_df, bk_df, mapping,
             date_window=int(date_window),
@@ -451,27 +508,31 @@ if run_btn:
             unmatched_iclass.to_excel(writer, sheet_name="unmatched_iclass_success", index=False)
             unmatched_bank.to_excel(writer, sheet_name="unmatched_bank_credit", index=False)
 
-            # Write a tiny config sheet for auditability
+            # config sheet for auditability
             cfg = pd.DataFrame({
                 "Parameter": [
                     "Date window (±days)", "Amount tolerance (₦)", "Require exact ref",
                     "Extract ref from narration", "Bank amount source",
                     "iClass Date", "iClass Amount", "iClass Ref (primary)", "iClass Ref (fallback)", "iClass Desc cols",
-                    "Bank Date", "Bank Ref", "Bank Desc", "Settlement Credit col", "Amount Paid col", "Charge col"
+                    "Bank Date", "Bank Ref", "Bank Desc",
+                    "Settlement Credit col", "Amount Paid col", "Charge col"
                 ],
                 "Value": [
                     date_window, amount_tol, require_exact_ref,
                     enrich_ref_from_bank_narr, bank_amount_source,
-                    ic_date, ic_amount, ic_ref_primary, ic_ref_fallback, ", ".join(ic_desc_cols) if ic_desc_cols else "",
-                    b_date, b_ref, b_desc, b_credit, b_amtpaid, b_charge
+                    mapping["ic_date"], mapping["ic_amount"], mapping["ic_ref_primary"], mapping["ic_ref_fallback"], ", ".join(mapping["ic_desc_cols"]) if mapping["ic_desc_cols"] else "",
+                    mapping["b_date"], mapping["b_ref"], mapping["b_desc"],
+                    mapping.get("b_credit") or "", mapping.get("b_amtpaid") or "", mapping.get("b_charge") or ""
                 ]
             })
             cfg.to_excel(writer, sheet_name="config", index=False)
 
-        st.download_button("⬇️ Download Excel (3 sheets + config)",
-                           data=output.getvalue(),
-                           file_name="reconciliation_output.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button(
+            "⬇️ Download Excel (3 sheets + config)",
+            data=output.getvalue(),
+            file_name="reconciliation_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
         st.download_button("⬇️ Download reconciled_iclass.csv",
                            data=recon.to_csv(index=False).encode("utf-8-sig"),
